@@ -12,7 +12,7 @@ Prompt de référence du système de mémoire externe multi-sessions
 
 ## Version courante
 
-**v1.17** — 030926
+**v1.18** — 030926
 
 ## Utilisation
 
