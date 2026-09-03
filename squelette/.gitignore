@@ -1,0 +1,34 @@
+# Mémoire externe — Paramétrage Visiophone
+
+# Fichiers temporaires
+*.log
+*.tmp
+screenlog.0
+screenlog.*
+*.bak
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — ne JAMAIS versionner d'identifiants
+.env
+*.key
+*.pem
+credentials*
+*secret*
+
+# Gros fichiers
+*.zip
+*.mp4
+*.mov
+*.iso
+
+# Logs volumineux
+journal/sessions/*.txt
+transcripts/*.log
+
+# Python
+__pycache__/
+*.pyc
