@@ -1,130 +1,197 @@
-name: Publier avis-croises vers main
+name: Promouvoir prompt depuis projets erbe-ops (W1 central)
 
 on:
-  push:
-    branches:
-      - 'arena/**'
-    paths:
-      - 'avis-croises/**'
+  schedule:
+    - cron: '0 * * * *' # horaire
   workflow_dispatch:
     inputs:
-      source_branch:
-        description: Branche Arena source à publier
-        required: true
+      source_repo:
+        description: 'Repo source spécifique (optionnel, ex: erbe-ops/01-template-projet)'
+        required: false
         type: string
+      dry_run:
+        description: 'Dry run (ne crée pas de PR)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
   pull-requests: write
 
 concurrency:
-  group: publish-avis-croises
+  group: promote-prompt
   cancel-in-progress: false
 
 env:
+  CENTRAL_FILE: 00.prompt.base.Github.md
   TARGET_BRANCH: main
-  PUBLICATION_BRANCH: automation/publish-avis-croises
 
 jobs:
-  publish:
+  promote:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Déterminer la branche source
-        id: source
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PUSH_BRANCH: ${{ github.ref_name }}
-          MANUAL_BRANCH: ${{ inputs.source_branch }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            source="$MANUAL_BRANCH"
-          else
-            source="$PUSH_BRANCH"
-          fi
-
-          case "$source" in
-            arena/*) ;;
-            *)
-              echo "Branche source refusée : $source"
-              exit 1
-              ;;
-          esac
-
-          echo "branch=$source" >> "$GITHUB_OUTPUT"
-
-      - name: Récupérer le dépôt
+      - name: Checkout central
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ steps.source.outputs.branch }}
 
-      - name: Valider le dossier source
-        env:
-          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
+      - name: Lire version centrale
+        id: central
         run: |
-          test -d avis-croises
-          find avis-croises -maxdepth 1 -type f -name '*.md' -print -quit | grep -q .
-          git fetch origin main "$SOURCE_BRANCH"
+          file="${{ env.CENTRAL_FILE }}"
+          test -f "$file"
+          ver=$(grep -E '^# Version' "$file" | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          sha=$(sha256sum "$file" | awk '{print $1}')
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "Central $ver $sha"
 
-      - name: Préparer la branche de publication
-        id: prepare
+      - name: Lister dépôts erbe-ops
+        id: repos
         env:
-          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REPO: ${{ inputs.source_repo }}
         run: |
-          git switch --create "$PUBLICATION_BRANCH" origin/main
-          git checkout "$SOURCE_BRANCH" -- avis-croises/
-          git add avis-croises/
+          if [ -n "$INPUT_REPO" ]; then
+            echo "$INPUT_REPO" > /tmp/repos.txt
+          else
+            gh repo list erbe-ops --limit 100 --json nameWithOwner --jq '.[].nameWithOwner' > /tmp/repos.txt
+          fi
+          cat /tmp/repos.txt
+          echo "count=$(wc -l < /tmp/repos.txt)" >> "$GITHUB_OUTPUT"
 
-          if git diff --cached --quiet; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+      - name: Scanner candidates
+        id: scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          central_ver="${{ steps.central.outputs.version }}"
+          central_sha="${{ steps.central.outputs.sha256 }}"
+          echo "[]" > /tmp/candidates.json
+          mkdir -p /tmp/candidates_files
+
+          while read -r repo; do
+            [ -z "$repo" ] && continue
+            [ "$repo" = "erbe-ops/arena-prompt-base" ] && continue
+            echo "=== Scan $repo ==="
+            b64=$(gh api repos/$repo/contents/${{ env.CENTRAL_FILE }} --jq '.content' 2>/dev/null || echo "")
+            if [ -z "$b64" ]; then
+              echo "  no file"
+              continue
+            fi
+            echo "$b64" | base64 -d > /tmp/candidate.md
+            cand_ver=$(grep -E '^# Version' /tmp/candidate.md | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            cand_sha=$(sha256sum /tmp/candidate.md | awk '{print $1}')
+            src_commit=$(gh api repos/$repo/commits?path=${{ env.CENTRAL_FILE }}&sha=main --jq '.[0].sha' 2>/dev/null || echo "unknown")
+            echo "  candidate $cand_ver $cand_sha from $src_commit"
+
+            if printf "%s\n%s\n" "$central_ver" "$cand_ver" | sort -V | tail -1 | grep -qx "$cand_ver" && [ "$cand_ver" != "$central_ver" ]; then
+              echo "  -> newer"
+              jq --arg repo "$repo" --arg ver "$cand_ver" --arg sha "$cand_sha" --arg commit "$src_commit" --arg base_ver "$central_ver" --arg base_sha "$central_sha" \
+                '. + [{"source_repo": $repo, "source_commit": $commit, "base_version": $base_ver, "base_sha256": $base_sha, "candidate_version": $ver, "candidate_sha256": $sha}]' \
+                /tmp/candidates.json > /tmp/tmp.json && mv /tmp/tmp.json /tmp/candidates.json
+              cp /tmp/candidate.md "/tmp/candidates_files/$(echo $repo | tr / _).md"
+            else
+              echo "  -> not newer"
+            fi
+          done < /tmp/repos.txt
+
+          cat /tmp/candidates.json
+          echo "count=$(jq length /tmp/candidates.json)" >> "$GITHUB_OUTPUT"
+          conflicts=$(jq -r 'group_by(.candidate_version) | map(select(length>1 and (map(.candidate_sha256) | unique | length>1))) | length' /tmp/candidates.json)
+          echo "conflicts=$conflicts" >> "$GITHUB_OUTPUT"
+
+      - name: Choisir meilleure candidate
+        if: steps.scan.outputs.count != '0'
+        id: choose
+        run: |
+          best=$(jq -r 'sort_by(.candidate_version | split(".") | map(tonumber)) | last' /tmp/candidates.json)
+          echo "$best" | jq .
+          echo "$best" > /tmp/best.json
+          echo "repo=$(echo $best | jq -r .source_repo)" >> "$GITHUB_OUTPUT"
+          echo "version=$(echo $best | jq -r .candidate_version)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(echo $best | jq -r .candidate_sha256)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(echo $best | jq -r .source_commit)" >> "$GITHUB_OUTPUT"
+          echo "base_version=$(echo $best | jq -r .base_version)" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$(echo $best | jq -r .base_sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Vérifier C2
+        if: steps.scan.outputs.count != '0'
+        id: c2
+        run: |
+          central_sha_now=$(sha256sum ${{ env.CENTRAL_FILE }} | awk '{print $1}')
+          central_ver_now=$(grep -E '^# Version' ${{ env.CENTRAL_FILE }} | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+          echo "central now $central_ver_now $central_sha_now"
+          echo "base expected ${{ steps.choose.outputs.base_version }} ${{ steps.choose.outputs.base_sha }}"
+          if [ "$central_ver_now" != "${{ steps.choose.outputs.base_version }}" ]; then
+            echo "C2 FAIL version"; exit 1
+          fi
+          if [ "$central_sha_now" != "${{ steps.choose.outputs.base_sha }}" ]; then
+            echo "C2 FAIL hash"; exit 1
+          fi
+          if [ "${{ steps.scan.outputs.conflicts }}" != "0" ]; then
+            echo "C2 CONFLICT same version different content"
+            jq . /tmp/candidates.json
+            exit 1
+          fi
+          echo "C2 OK"
+
+      - name: Créer branche de promotion
+        if: steps.scan.outputs.count != '0' && inputs.dry_run == false
+        env:
+          REPO: ${{ steps.choose.outputs.repo }}
+          VERSION: ${{ steps.choose.outputs.version }}
+        run: |
+          branch="promotion/$(echo $REPO | tr / -)-v$VERSION"
+          echo "branch=$branch" >> "$GITHUB_ENV"
+          git checkout -b "$branch"
+          src_file="/tmp/candidates_files/$(echo $REPO | tr / _).md"
+          cp "$src_file" "${{ env.CENTRAL_FILE }}"
+          git add "${{ env.CENTRAL_FILE }}"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "prompt base: ${{ steps.choose.outputs.base_version }} -> $VERSION from $REPO@${{ steps.choose.outputs.commit }}
+
+          source_repo: $REPO
+          source_commit: ${{ steps.choose.outputs.commit }}
+          base_version: ${{ steps.choose.outputs.base_version }}
+          base_sha256: ${{ steps.choose.outputs.base_sha }}
+          candidate_version: $VERSION
+          candidate_sha256: ${{ steps.choose.outputs.sha }}"
+          git push origin "$branch" --force-with-lease
+
+      - name: Ouvrir PR
+        if: steps.scan.outputs.count != '0' && inputs.dry_run == false
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ steps.choose.outputs.repo }}
+          VERSION: ${{ steps.choose.outputs.version }}
+        run: |
+          existing=$(gh pr list --base ${{ env.TARGET_BRANCH }} --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "number=$existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          body="Promotion automatique ${{ steps.choose.outputs.base_version }} -> $VERSION depuis $REPO
 
-          git -c user.name='github-actions[bot]' \
-              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -m "Publish avis-croises/ from ${SOURCE_BRANCH}"
-          git push --force-with-lease origin \
-            "HEAD:${PUBLICATION_BRANCH}"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          Manifest C2:
+          - source_repo: $REPO
+          - source_commit: ${{ steps.choose.outputs.commit }}
+          - base_version: ${{ steps.choose.outputs.base_version }}
+          - base_sha256: ${{ steps.choose.outputs.base_sha }}
+          - candidate_version: $VERSION
+          - candidate_sha256: ${{ steps.choose.outputs.sha }}
 
-      - name: Vérifier la PR existante ou la créer
-        if: steps.prepare.outputs.changed == 'true'
-        id: pull_request
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
-        run: |
-          pr=$(gh pr list \
-            --base "$TARGET_BRANCH" \
-            --head "$PUBLICATION_BRANCH" \
-            --state open \
-            --json number \
-            --jq '.[0].number // empty')
-
-          if [ -z "$pr" ]; then
-            gh pr create \
-              --base "$TARGET_BRANCH" \
-              --head "$PUBLICATION_BRANCH" \
-              --title "Publier avis-croises/ vers main" \
-              --body "Publication automatique du dossier avis-croises/ depuis ${SOURCE_BRANCH}. Aucun autre fichier n'est inclus."
-
-            pr=$(gh pr list \
-              --base "$TARGET_BRANCH" \
-              --head "$PUBLICATION_BRANCH" \
-              --state open \
-              --json number \
-              --jq '.[0].number')
-          fi
-
+          Vérifs: version > centrale OK, base inchangée OK, pas de conflit OK
+          Source: https://github.com/$REPO/commit/${{ steps.choose.outputs.commit }}
+          "
+          gh pr create --base ${{ env.TARGET_BRANCH }} --head "$branch" --title "Promouvoir prompt v$VERSION depuis $REPO" --body "$body"
+          pr=$(gh pr list --base ${{ env.TARGET_BRANCH }} --head "$branch" --state open --json number --jq '.[0].number')
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
-      - name: Activer l’auto-merge
-        if: steps.prepare.outputs.changed == 'true'
+      - name: Auto-merge PR
+        if: steps.scan.outputs.count != '0' && inputs.dry_run == false
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr merge "${{ steps.pull_request.outputs.number }}" \
-            --auto \
-            --squash \
-            --delete-branch=false
+          gh pr merge "${{ steps.pr.outputs.number }}" --auto --squash --delete-branch=false
