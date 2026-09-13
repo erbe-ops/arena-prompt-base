@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: 'Repo source spécifique (optionnel, ex: erbe-ops/01-template-projet)'
+        description: 'Repo source spécifique (ex: erbe-ops/01-template-projet) - vide = scan tous'
         required: false
         type: string
       dry_run:
@@ -47,55 +47,120 @@ jobs:
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
           echo "Central $ver $sha"
 
-      - name: Lister dépôts erbe-ops
-        id: repos
+      - name: Préparer token lecture projets privés
+        id: token
         env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_REPO: ${{ inputs.source_repo }}
+          HAS_PAT: ${{ secrets.PAT_RO != '' }}
         run: |
-          if [ -n "$INPUT_REPO" ]; then
-            echo "$INPUT_REPO" > /tmp/repos.txt
+          if [ "$HAS_PAT" = "true" ]; then
+            echo "Utilise PAT_RO secret pour lire dépôts privés"
+            echo "pat_exists=true" >> "$GITHUB_OUTPUT"
           else
-            gh repo list erbe-ops --limit 100 --json nameWithOwner --jq '.[].nameWithOwner' > /tmp/repos.txt
+            echo "PAT_RO absent - GITHUB_TOKEN ne peut pas lire les dépôts privés erbe-ops"
+            echo "Si tes projets sont privés, crée un PAT_RO (voir README)"
+            echo "pat_exists=false" >> "$GITHUB_OUTPUT"
           fi
-          cat /tmp/repos.txt
-          echo "count=$(wc -l < /tmp/repos.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repo source spécifique (si fourni)
+        if: inputs.source_repo != ''
+        id: checkout_source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: main
+          path: /tmp/source_repo
+          token: ${{ secrets.PAT_RO || github.token }}
 
       - name: Scanner candidates
         id: scan
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_RO || github.token }}
+          INPUT_REPO: ${{ inputs.source_repo }}
+          PAT_EXISTS: ${{ steps.token.outputs.pat_exists }}
         run: |
           central_ver="${{ steps.central.outputs.version }}"
           central_sha="${{ steps.central.outputs.sha256 }}"
           echo "[]" > /tmp/candidates.json
           mkdir -p /tmp/candidates_files
 
-          while read -r repo; do
-            [ -z "$repo" ] && continue
-            [ "$repo" = "erbe-ops/arena-prompt-base" ] && continue
-            echo "=== Scan $repo ==="
-            b64=$(gh api repos/$repo/contents/${{ env.CENTRAL_FILE }} --jq '.content' 2>/dev/null || echo "")
-            if [ -z "$b64" ]; then
-              echo "  no file"
-              continue
+          # Mode 1 : repo spécifique fourni -> lecture directe depuis checkout
+          if [ -n "$INPUT_REPO" ]; then
+            echo "=== Mode repo spécifique : $INPUT_REPO ==="
+            src_path="/tmp/source_repo/${{ env.CENTRAL_FILE }}"
+            if [ ! -f "$src_path" ]; then
+              echo "Fichier $src_path introuvable après checkout"
+              echo "Vérifie que le repo existe, est accessible avec le token, et contient ${{ env.CENTRAL_FILE }} sur main"
+              ls -la /tmp/source_repo/ || true
+              exit 1
             fi
-            echo "$b64" | base64 -d > /tmp/candidate.md
-            cand_ver=$(grep -E '^# Version' /tmp/candidate.md | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-            cand_sha=$(sha256sum /tmp/candidate.md | awk '{print $1}')
-            src_commit=$(gh api repos/$repo/commits?path=${{ env.CENTRAL_FILE }}&sha=main --jq '.[0].sha' 2>/dev/null || echo "unknown")
+            cand_ver=$(grep -E '^# Version' "$src_path" | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            cand_sha=$(sha256sum "$src_path" | awk '{print $1}')
+            # commit sha du fichier
+            src_commit=$(git -C /tmp/source_repo log -1 --format=%H -- "${{ env.CENTRAL_FILE }}" 2>/dev/null || echo "unknown")
             echo "  candidate $cand_ver $cand_sha from $src_commit"
 
             if printf "%s\n%s\n" "$central_ver" "$cand_ver" | sort -V | tail -1 | grep -qx "$cand_ver" && [ "$cand_ver" != "$central_ver" ]; then
-              echo "  -> newer"
-              jq --arg repo "$repo" --arg ver "$cand_ver" --arg sha "$cand_sha" --arg commit "$src_commit" --arg base_ver "$central_ver" --arg base_sha "$central_sha" \
+              echo "  -> newer than central"
+              jq --arg repo "$INPUT_REPO" --arg ver "$cand_ver" --arg sha "$cand_sha" --arg commit "$src_commit" --arg base_ver "$central_ver" --arg base_sha "$central_sha" \
                 '. + [{"source_repo": $repo, "source_commit": $commit, "base_version": $base_ver, "base_sha256": $base_sha, "candidate_version": $ver, "candidate_sha256": $sha}]' \
                 /tmp/candidates.json > /tmp/tmp.json && mv /tmp/tmp.json /tmp/candidates.json
-              cp /tmp/candidate.md "/tmp/candidates_files/$(echo $repo | tr / _).md"
+              cp "$src_path" "/tmp/candidates_files/$(echo $INPUT_REPO | tr / _).md"
             else
-              echo "  -> not newer"
+              echo "  -> not newer (central $central_ver, candidate $cand_ver)"
             fi
-          done < /tmp/repos.txt
+          else
+            # Mode 2 : scan tous les repos erbe-ops
+            echo "=== Mode scan tous les repos erbe-ops ==="
+            if [ "$PAT_EXISTS" != "true" ]; then
+              echo "ATTENTION: PAT_RO absent, le scan des dépôts privés va échouer"
+              echo "Crée un secret PAT_RO avec scope repo:read (voir README)"
+            fi
+            gh repo list erbe-ops --limit 100 --json nameWithOwner --jq '.[].nameWithOwner' > /tmp/repos.txt
+            cat /tmp/repos.txt
+
+            while read -r repo; do
+              [ -z "$repo" ] && continue
+              [ "$repo" = "erbe-ops/arena-prompt-base" ] && continue
+              echo "=== Scan $repo ==="
+              # Essai 1 : raw.githubusercontent avec token PAT (plus fiable que base64 API)
+              # Utilise curl avec auth si PAT présent
+              if [ "$PAT_EXISTS" = "true" ]; then
+                curl -sL -H "Authorization: token ${{ secrets.PAT_RO }}" "https://raw.githubusercontent.com/$repo/main/${{ env.CENTRAL_FILE }}" -o /tmp/candidate.md || true
+              else
+                curl -sL "https://raw.githubusercontent.com/$repo/main/${{ env.CENTRAL_FILE }}" -o /tmp/candidate.md || true
+              fi
+
+              # Fallback : gh api contents si curl échoue (pour compat)
+              if [ ! -s /tmp/candidate.md ] || ! grep -q "Version" /tmp/candidate.md; then
+                echo "  curl a échoué ou fichier vide, essai gh api"
+                b64=$(gh api repos/$repo/contents/${{ env.CENTRAL_FILE }} --jq '.content' 2>/dev/null || echo "")
+                if [ -n "$b64" ]; then
+                  # nettoyage base64 : supprime retours ligne, ignore garbage
+                  echo "$b64" | tr -d '\n\r ' | base64 -d -i > /tmp/candidate.md 2>/dev/null || echo "" > /tmp/candidate.md
+                fi
+              fi
+
+              if [ ! -s /tmp/candidate.md ] || ! grep -q "Version" /tmp/candidate.md; then
+                echo "  no file or not accessible"
+                continue
+              fi
+
+              cand_ver=$(grep -E '^# Version' /tmp/candidate.md | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+              cand_sha=$(sha256sum /tmp/candidate.md | awk '{print $1}')
+              src_commit=$(gh api repos/$repo/commits?path=${{ env.CENTRAL_FILE }}&sha=main --jq '.[0].sha' 2>/dev/null || echo "unknown")
+              echo "  candidate $cand_ver $cand_sha from $src_commit"
+
+              if printf "%s\n%s\n" "$central_ver" "$cand_ver" | sort -V | tail -1 | grep -qx "$cand_ver" && [ "$cand_ver" != "$central_ver" ]; then
+                echo "  -> newer"
+                jq --arg repo "$repo" --arg ver "$cand_ver" --arg sha "$cand_sha" --arg commit "$src_commit" --arg base_ver "$central_ver" --arg base_sha "$central_sha" \
+                  '. + [{"source_repo": $repo, "source_commit": $commit, "base_version": $base_ver, "base_sha256": $base_sha, "candidate_version": $ver, "candidate_sha256": $sha}]' \
+                  /tmp/candidates.json > /tmp/tmp.json && mv /tmp/tmp.json /tmp/candidates.json
+                cp /tmp/candidate.md "/tmp/candidates_files/$(echo $repo | tr / _).md"
+              else
+                echo "  -> not newer"
+              fi
+            done < /tmp/repos.txt
+          fi
 
           cat /tmp/candidates.json
           echo "count=$(jq length /tmp/candidates.json)" >> "$GITHUB_OUTPUT"
@@ -125,13 +190,13 @@ jobs:
           echo "central now $central_ver_now $central_sha_now"
           echo "base expected ${{ steps.choose.outputs.base_version }} ${{ steps.choose.outputs.base_sha }}"
           if [ "$central_ver_now" != "${{ steps.choose.outputs.base_version }}" ]; then
-            echo "C2 FAIL version"; exit 1
+            echo "C2 FAIL version centrale a changé"; exit 1
           fi
           if [ "$central_sha_now" != "${{ steps.choose.outputs.base_sha }}" ]; then
-            echo "C2 FAIL hash"; exit 1
+            echo "C2 FAIL hash central a changé"; exit 1
           fi
           if [ "${{ steps.scan.outputs.conflicts }}" != "0" ]; then
-            echo "C2 CONFLICT same version different content"
+            echo "C2 CONFLICT même version contenus différents"
             jq . /tmp/candidates.json
             exit 1
           fi
