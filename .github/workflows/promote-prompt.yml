@@ -1,0 +1,130 @@
+name: Publier avis-croises vers main
+
+on:
+  push:
+    branches:
+      - 'arena/**'
+    paths:
+      - 'avis-croises/**'
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: Branche Arena source à publier
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: publish-avis-croises
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: main
+  PUBLICATION_BRANCH: automation/publish-avis-croises
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Déterminer la branche source
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BRANCH: ${{ github.ref_name }}
+          MANUAL_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            source="$MANUAL_BRANCH"
+          else
+            source="$PUSH_BRANCH"
+          fi
+
+          case "$source" in
+            arena/*) ;;
+            *)
+              echo "Branche source refusée : $source"
+              exit 1
+              ;;
+          esac
+
+          echo "branch=$source" >> "$GITHUB_OUTPUT"
+
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.source.outputs.branch }}
+
+      - name: Valider le dossier source
+        env:
+          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
+        run: |
+          test -d avis-croises
+          find avis-croises -maxdepth 1 -type f -name '*.md' -print -quit | grep -q .
+          git fetch origin main "$SOURCE_BRANCH"
+
+      - name: Préparer la branche de publication
+        id: prepare
+        env:
+          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
+        run: |
+          git switch --create "$PUBLICATION_BRANCH" origin/main
+          git checkout "$SOURCE_BRANCH" -- avis-croises/
+          git add avis-croises/
+
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "Publish avis-croises/ from ${SOURCE_BRANCH}"
+          git push --force-with-lease origin \
+            "HEAD:${PUBLICATION_BRANCH}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Vérifier la PR existante ou la créer
+        if: steps.prepare.outputs.changed == 'true'
+        id: pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
+        run: |
+          pr=$(gh pr list \
+            --base "$TARGET_BRANCH" \
+            --head "$PUBLICATION_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -z "$pr" ]; then
+            gh pr create \
+              --base "$TARGET_BRANCH" \
+              --head "$PUBLICATION_BRANCH" \
+              --title "Publier avis-croises/ vers main" \
+              --body "Publication automatique du dossier avis-croises/ depuis ${SOURCE_BRANCH}. Aucun autre fichier n'est inclus."
+
+            pr=$(gh pr list \
+              --base "$TARGET_BRANCH" \
+              --head "$PUBLICATION_BRANCH" \
+              --state open \
+              --json number \
+              --jq '.[0].number')
+          fi
+
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Activer l’auto-merge
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr merge "${{ steps.pull_request.outputs.number }}" \
+            --auto \
+            --squash \
+            --delete-branch=false
