@@ -12,21 +12,16 @@ Prompt de référence du système de mémoire externe multi-sessions
 
 ## Version courante
 
-**v1.18** — 030926
+**v2.1 (noyau) — Annexes 2.1** — 20260917
 
 ## Utilisation
 
-Chaque projet embarque **sa copie** de `00.prompt.base.Github.md` : elle est lue au tour 1, avant
-tout accès réseau, et reste lisible hors ligne. **Ce dépôt fait foi en cas de divergence.**
-
-Lien brut à comparer au premier tour de chaque session :
-
-```
+Chaque projet embarque sa copie de `00.prompt.base.Github.md` (noyau) + `00.annexes.Github.md` (annexes).
+Le noyau est lu au tour 1, avant tout accès réseau, et reste lisible hors ligne. Ce dépôt fait foi.
+Lien brut noyau :
 https://raw.githubusercontent.com/erbe-ops/arena-prompt-base/main/00.prompt.base.Github.md
-```
-
-L'agent **signale** un écart de version et **propose** la mise à jour ; il n'écrase jamais la copie
-locale sans accord explicite.
+Lien brut annexes :
+https://raw.githubusercontent.com/erbe-ops/arena-prompt-base/main/00.annexes.Github.md
 
 ## Historique des versions
 
